@@ -1,0 +1,20 @@
+# Ambiente Virtual Python
+venv_py311/
+venv_bot/
+venv/
+*.pyc
+__pycache__/
+.env
+
+# Arquivos de credenciais
+credentials.json
+
+# Arquivos de log (se você gerar algum)
+*.log
+
+# Arquivos específicos do VSCode (opcional, mas bom)
+.vscode/
+
+# Arquivos específicos do sistema operacional
+.DS_Store
+Thumbs.db
