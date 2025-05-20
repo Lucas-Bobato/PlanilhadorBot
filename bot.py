@@ -3,15 +3,14 @@ import os
 import json
 from io import BytesIO
 from datetime import datetime
-import re 
-
+import re
 import google.generativeai as genai
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-
 from dotenv import load_dotenv
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+# from apscheduler.schedulers.asyncio import AsyncIOScheduler # No longer creating a custom scheduler instance here
 
 # Carregar variáveis de ambiente do arquivo .env
 load_dotenv()
@@ -20,21 +19,21 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-DEFAULT_SHEET_TAB_NAME = os.getenv("GOOGLE_SHEET_TAB_NAME", "Página1") 
+DEFAULT_SHEET_TAB_NAME = os.getenv("GOOGLE_SHEET_TAB_NAME", "Página1")
 GOOGLE_CREDENTIALS_FILE = 'credentials.json'
 SCOPES_SHEETS = ['https://www.googleapis.com/auth/spreadsheets']
 
 ACTIVE_SHEET_TAB_NAME = DEFAULT_SHEET_TAB_NAME
 
 logging.basicConfig(
-    format="%(asctime)s | [%(levelname)s] | %(name)s: %(message)s", 
+    format="%(asctime)s | [%(levelname)s] | %(name)s: %(message)s",
     datefmt='%H:%M:%S',
     level=logging.INFO
 )
 logger = logging.getLogger("PlanilhadorBot")
 
 
-sheets_service = None 
+sheets_service = None
 gemini_model = None
 
 def initialize_sheets_service_on_startup(credentials_file_path, scopes):
@@ -98,7 +97,7 @@ async def ensure_sheet_headers(spreadsheet_id, tab_name, headers_map_managed_by_
         if not managed_cols: logger.info(f"Nenhum cabeçalho a ser gerenciado pelo bot para aba {tab_name}."); return
         max_managed_col_char = managed_cols[-1]
         range_managed_headers = f"{tab_name}!A1:{max_managed_col_char}1"
-        
+
         try:
             sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
             sheets = sheet_metadata.get('sheets', [])
@@ -111,9 +110,9 @@ async def ensure_sheet_headers(spreadsheet_id, tab_name, headers_map_managed_by_
         except Exception as e_sheet_create:
             logger.error(f"Erro ao verificar/criar aba '{tab_name}': {e_sheet_create}")
             # Prossegue para tentar ler/escrever cabeçalhos, pode falhar se a criação falhou
-            
+
         result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_managed_headers).execute()
-        current_row_values = result.get('values', [[]])[0]
+        current_row_values = result.get('values', [[]])[0] if result.get('values') else [] # ensure current_row_values is a list
         num_cols_to_write = ord(max_managed_col_char) - ord('A') + 1
         header_row_to_write = [''] * num_cols_to_write
         needs_update = False
@@ -167,29 +166,37 @@ def build_gemini_prompt(image_bytes: bytes):
     image_parts = [{"mime_type": "image/jpeg", "data": image_bytes}]
     prompt_text = """
     Analise a imagem desta aposta esportiva e extraia as seguintes informações em formato JSON.
-    Se uma informação não estiver claramente visível, retorne null ou uma string vazia para o campo correspondente.
+    Se uma informação não estiver claramente visível ou não aplicável, retorne null ou uma string vazia para o campo correspondente.
 
     Campos a serem extraídos:
-    - "evento_times": String. Os times ou evento principal da aposta.
-    - "aposta_descricao_completa": String. A descrição principal da aposta.
-    - "odd": String ou Float. A odd principal, priorize promocional/maior. Formate com ponto decimal.
-    - "unidade_imagem": String ou Float. A unidade da aposta, APENAS SE VISÍVEL DENTRO DA IMAGEM (ex: "0.75u" -> "0.75"). Se não estiver na imagem, retorne null.
-    - "casa_de_aposta_tentativa_gemini": String. Identifique a casa de apostas ("Superbet", "Bet365", ou "A Definir") com base nos seguintes critérios, priorizando o primeiro que se aplicar:
-        1. Texto Explícito: Se o nome "Superbet" ou "Bet365" estiver claramente visível na imagem, use esse nome.
-        2. Cores Distintivas da Interface:
-           - SUPERBET: Geralmente apresenta uma distinta BARRA LATERAL VERMELHA à esquerda da área principal da aposta, OU a interface tem um tema escuro com elementos de destaque importantes (como botões ou odds promocionais) em VERMELHO ou LARANJA.
-           - BET365: Geralmente apresenta um tema ESCURO, e em layouts de "Criar Aposta" ou "Bet Builder", os ITENS DE SELEÇÃO INDIVIDUAL ou os NOMES DOS JOGADORES são destacados em tons de VERDE. A palavra "Stake" também pode estar presente perto de um campo de valor.
-        Se nenhum desses critérios for atendido de forma clara, ou se houver ambiguidade, retorne "A Definir".
-    - "data_hora_evento_imagem": String. Data ou hora do evento na imagem.
-    - "todos_textos_visiveis": Array de Strings. Extraia o máximo de texto possível da imagem, incluindo botões como "+ Adicionar", "Crear Apuesta", "BET BUILDER", "Stake", "Importe", etc. Este campo é MUITO IMPORTANTE para uma possível identificação da casa de apostas por palavras-chave no código do bot se a identificação por cor/layout falhar.
+    - "evento_times": String. Os times ou evento principal da aposta. Se os nomes dos times estiverem em linhas separadas na imagem, junte-os com " vs " ou mantenha a quebra de linha (ex: "Time A\nTime B").
+    - "aposta_descricao_completa": String. A descrição principal e MAIS COMPLETA da aposta. Se a aposta for em um mercado específico de um time ou jogador (ex: Handicap, Total de Pontos do Jogador, Jogador para Marcar), inclua o nome do time/jogador e o valor específico da linha (ex: "Lietkabelis (-13.5)", "Hartenstein, Isaiah - Menos de 8.5 rebotes"). Combine múltiplas seleções de um "bet builder" ou aposta acumulada em uma única string, idealmente separadas por " E " ou por uma quebra de linha "\\n" se visualmente distintas na imagem.
+    - "odd": String ou Float. A odd principal da aposta. Priorize odds promocionais, aumentadas ou a odd final da aposta combinada, se visível. Formate com ponto decimal (ex: "1.95", "2.05").
+    - "unidade_imagem": String ou Float. A unidade da aposta (valor da stake), APENAS SE VISÍVEL CLARAMENTE DENTRO DA IMAGEM (ex: "0.75u" -> "0.75", "R$10" com indicação de unidade -> pode ser interpretado se o padrão de unidade for claro). Se não estiver na imagem ou for ambíguo, retorne null. Não confunda com odds ou outros números.
+    - "casa_de_aposta_tentativa_gemini": String. Identifique a casa de apostas ("Superbet", "Bet365", ou "A Definir"). Analise CUIDADOSAMENTE o texto explícito na imagem, as cores/layout da interface E os textos extraídos em `todos_textos_visiveis`. Priorize os critérios na ordem listada para cada casa:
+        1. Texto Explícito na Imagem: Se o nome "Superbet" ou "Bet365" estiver claramente visível na imagem, use esse nome.
+
+        2. Identificação da SUPERBET:
+           a. Palavras-chave (em `todos_textos_visiveis` ou na imagem): Se o texto "+ Adicionar" (frequentemente em um botão) ou variações como "Adicionar à caderneta de apostas" estiverem presentes, é uma FORTE indicação de Superbet.
+           b. Cores/Layout Distintivos: Geralmente apresenta uma distinta BARRA LATERAL VERMELHA à esquerda da área principal da aposta (comum em desktop/tablet). A interface pode ter um tema escuro com elementos de destaque importantes (como botões de ação, odds promocionais/aumentadas, ou banners) em VERMELHO VIVO ou LARANJA. O logo da Superbet (um "S" estilizado) também pode estar presente.
+           Se qualquer um desses critérios (2a ou 2b) para Superbet for fortemente atendido, classifique como "Superbet".
+
+        3. Identificação da BET365:
+           a. Palavras-chave (em `todos_textos_visiveis` ou na imagem): Se textos como "Crear Aposta", "Bet Builder", "Criar Aposta Personalizada", "Minhas Apostas", ou a palavra "Stake" (próxima a um campo de valor de aposta ou indicando o valor apostado) estiverem presentes, é uma FORTE indicação de Bet365. O logo da Bet365 (texto ou ícone) também é um identificador claro.
+           b. Cores/Layout Distintivos: Geralmente apresenta um tema predominantemente ESCURO (tons de cinza escuro ou preto). Em layouts de "Criar Aposta" ou "Bet Builder", os ITENS DE SELEÇÃO INDIVIDUAL, os NOMES DOS JOGADORES, ou interruptores de seleção são frequentemente destacados em tons de VERDE CLARO ou AMARELO sobre fundo escuro. Odds geralmente aparecem em amarelo ou branco.
+           Se qualquer um desses critérios (3a ou 3b) para Bet365 for fortemente atendido, classifique como "Bet365".
+
+        Se, após aplicar todas essas verificações, a casa não puder ser identificada claramente como Superbet ou Bet365, ou se houver ambiguidade significativa, retorne "A Definir". Dê preferência a uma identificação positiva se os critérios forem atendidos, em vez de retornar "A Definir" prematuramente. Considere a combinação dos fatores.
+    - "data_hora_evento_imagem": String. Data e/ou hora do evento conforme visível na imagem (ex: "Hoje, 13:30", "Dom., 25, 16:00"). Se apenas a data ou apenas a hora estiver visível, extraia o que estiver presente.
+    - "todos_textos_visiveis": Array de Strings. Extraia o máximo de texto possível da imagem, incluindo nomes de times, jogadores, mercados, odds, botões ("+ Adicionar", "Crear Apuesta", "BET BUILDER", "Stake", "Apostar", "Fazer Aposta"), nomes de campeonatos, datas, horas, etc. Este campo é MUITO IMPORTANTE para verificação e para ajudar na identificação da casa de apostas caso os critérios visuais sejam ambíguos. Tente manter a ordem e agrupamento dos textos como aparecem na imagem, se possível.
 
     Exemplo de JSON esperado:
     {
       "evento_times": "Liquid vs FaZe",
       "aposta_descricao_completa": "s1mple terá Mais de 30.5 abates nos mapas 1-2 (Inc. prorrogação)",
       "odd": "1.95",
-      "unidade_imagem": "1", 
-      "casa_de_aposta_tentativa_gemini": "Superbet", 
+      "unidade_imagem": "1",
+      "casa_de_aposta_tentativa_gemini": "Superbet",
       "data_hora_evento_imagem": "Hoje, 13:30",
       "todos_textos_visiveis": ["Counter-Strike 2", "ESL", "IEM Dallas", "Hoje, 13:30", "Liquid", "FaZe", "s1mple terá Mais de 30.5 abates nos mapas 1-2 (Inc. prorrogação)", "1.85", "1.95", "1u - Min: 1.95", "Bobets - EV+ - VIP", "+ Adicionar"]
     }
@@ -214,17 +221,17 @@ def extract_unit_from_caption(caption: str) -> str | None:
     return str(max_unit) if found_any_unit else None
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global ACTIVE_SHEET_TAB_NAME 
-    data_from_gemini = {} 
+    global ACTIVE_SHEET_TAB_NAME
+    data_from_gemini = {}
     if not gemini_model: await update.message.reply_text("Serviço de análise de imagem não configurado."); return
     if not sheets_service: await update.message.reply_text("Integração com a planilha não configurada."); return
 
     photo_file = await update.message.photo[-1].get_file()
-    image_caption = update.message.caption 
+    image_caption = update.message.caption
     image_bytes_io = BytesIO()
     await photo_file.download_to_memory(image_bytes_io)
     image_bytes_io.seek(0)
-    
+
     try:
         img_bytes_for_gemini = image_bytes_io.getvalue()
         await update.message.reply_text(f"Analisando imagem para aba '{ACTIVE_SHEET_TAB_NAME}'...")
@@ -249,13 +256,13 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info(f"Próxima linha para inserção na aba '{ACTIVE_SHEET_TAB_NAME}': {target_row_number}")
 
         data_aposta_str = data_from_gemini.get("data_hora_evento_imagem", "")
-        data_col_b = datetime.now().strftime("%d/%m/%y") 
-        if data_aposta_str and "hoje" not in data_aposta_str.lower(): data_col_b = data_aposta_str 
-        
+        data_col_b = datetime.now().strftime("%d/%m/%y")
+        if data_aposta_str and "hoje" not in data_aposta_str.lower(): data_col_b = data_aposta_str
+
         entrada_col_c = data_from_gemini.get("aposta_descricao_completa", "N/A")
-        
+
         casa_col_d = data_from_gemini.get("casa_de_aposta_tentativa_gemini", "A Definir")
-        if casa_col_d in ["A Definir", "null", None, ""]: 
+        if casa_col_d in ["A Definir", "null", None, ""]:
             todos_textos_visiveis = data_from_gemini.get("todos_textos_visiveis", [])
             texto_completo_para_analise = " ".join(str(t).lower() for t in todos_textos_visiveis)
             texto_completo_para_analise += f" {str(entrada_col_c).lower()} {str(data_from_gemini.get('evento_times','')).lower()}"
@@ -264,10 +271,10 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.info(f"Casa definida por fallback: {casa_col_d} (Gemini: '{data_from_gemini.get('casa_de_aposta_tentativa_gemini')}')")
         else:
             logger.info(f"Casa definida pelo Gemini: {casa_col_d}")
-        
+
         odd_str = str(data_from_gemini.get("odd", "N/A"))
         odd_col_e = odd_str.replace('.', ',') if odd_str != "N/A" else "N/A"
-        
+
         unidade_final_str = "N/A"
         unidade_da_legenda = extract_unit_from_caption(image_caption)
         if unidade_da_legenda:
@@ -281,28 +288,26 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             else:
                 logger.info("Unidade não encontrada.")
         unidade_col_f = unidade_final_str.replace('.', ',') if unidade_final_str not in ["N/A", "None", "null", ""] else "N/A"
-        
+
         status_col_g = "Pré-Live"
 
         row_to_insert_values = [
-            "", data_col_b, entrada_col_c, casa_col_d, odd_col_e, 
+            "", data_col_b, entrada_col_c, casa_col_d, odd_col_e,
             unidade_col_f, status_col_g
         ]
-        
+
         success_write = await update_sheet_row(
             sheets_service, GOOGLE_SHEET_ID, ACTIVE_SHEET_TAB_NAME,
             target_row_number, row_to_insert_values
         )
-        
+
         if success_write:
-            # --- Mensagem de Resposta Mais Concisa ---
             confirm_message = f"✅ Aposta '{entrada_col_c}' adicionada à aba '{ACTIVE_SHEET_TAB_NAME}' (linha {target_row_number})."
             if casa_col_d != "A Definir":
                 confirm_message += f"\nCasa: {casa_col_d}"
             if unidade_col_f != "N/A":
                 confirm_message += f" | Unidades: {unidade_col_f}"
             await update.message.reply_text(confirm_message)
-            # --- Fim da Mensagem de Resposta Mais Concisa ---
         else:
             await update.message.reply_text(f"Falha ao adicionar dados à aba '{ACTIVE_SHEET_TAB_NAME}'.")
 
@@ -311,7 +316,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"Ocorreu um erro ao processar a imagem: {str(e)}")
 
 async def post_init(application: Application) -> None:
-    global ACTIVE_SHEET_TAB_NAME 
+    global ACTIVE_SHEET_TAB_NAME
     await application.bot.set_my_commands([
         BotCommand("start", "Inicia o bot e mostra aba ativa"),
         BotCommand("pagina", "Muda a aba da planilha. Ex: /pagina Junho")
@@ -326,6 +331,8 @@ async def post_init(application: Application) -> None:
         logger.warning("Serviço do Sheets não disponível para verificar cabeçalhos na aba ativa inicial.")
 
 def main() -> None:
+    global ACTIVE_SHEET_TAB_NAME # Ensure this is here if you modify it in main
+
     initialize_sheets_service_on_startup(GOOGLE_CREDENTIALS_FILE, SCOPES_SHEETS)
     initialize_gemini_model()
 
@@ -335,19 +342,24 @@ def main() -> None:
     if not GOOGLE_SHEET_ID:
          logger.critical("ID da Planilha Google não definido. Encerrando.")
          return
-    global ACTIVE_SHEET_TAB_NAME 
-    if not ACTIVE_SHEET_TAB_NAME: 
+
+    if not ACTIVE_SHEET_TAB_NAME:
         logger.warning("Nome da aba da planilha não definido no .env. Usando 'Página1' como padrão.")
         ACTIVE_SHEET_TAB_NAME = "Página1"
-        
-    if not sheets_service: 
-        logger.critical("Serviço do Google Sheets não pôde ser inicializado. Verifique os logs e credentials.json. Encerrando.")
+
+    if not sheets_service:
+        logger.critical("Serviço do Google Sheets não pôde ser inicializado.")
         return
     if not gemini_model:
-        logger.warning("Modelo Gemini não pôde ser inicializado. Análise de imagem desabilitada.")
-        
-    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+        logger.warning("Modelo Gemini não pôde ser inicializado.")
+
+    # Attempting to run with default scheduler settings due to API issues with PTB v22.1
+    logger.info("Using default APScheduler settings. Timezone configuration is omitted due to PTB v22.1 API issues.")
+    logger.warning("The bot will use APScheduler's default timezone detection. This might lead to errors if pytz cannot determine the local timezone.")
+
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN) # Removed .scheduler_options()
     application = builder.post_init(post_init).build()
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("pagina", change_page_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_image))
